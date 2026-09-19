@@ -53,3 +53,14 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# Build output
+src/client
+src/server
+*.o
+
+# Never commit these
+*.pem
+known_hosts
+*.bin
+private/
