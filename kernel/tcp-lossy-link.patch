@@ -1,0 +1,88 @@
+--- ../linux-aws-4.4.0-orig/include/net/tcp.h	2026-09-19 06:33:29.798015524 +0000
++++ include/net/tcp.h	2026-09-19 06:37:48.653425382 +0000
+@@ -277,6 +277,7 @@
+ extern int sysctl_tcp_thin_linear_timeouts;
+ extern int sysctl_tcp_thin_dupack;
+ extern int sysctl_tcp_early_retrans;
++extern int sysctl_tcp_lossy_link;
+ extern int sysctl_tcp_limit_output_bytes;
+ extern int sysctl_tcp_challenge_ack_limit;
+ extern unsigned int sysctl_tcp_notsent_lowat;
+--- ../linux-aws-4.4.0-orig/net/ipv4/tcp_input.c	2026-09-19 06:33:31.558011149 +0000
++++ net/ipv4/tcp_input.c	2026-09-19 06:37:48.661425366 +0000
+@@ -101,6 +101,11 @@
+ 
+ int sysctl_tcp_moderate_rcvbuf __read_mostly = 1;
+ int sysctl_tcp_early_retrans __read_mostly = 3;
++/* EE542: bit mask, see Documentation in kernel/apply-lossy-link.py.
++ * 1 = no exponential RTO back-off, 2 = keep cwnd on RTO,
++ * 4 = no cwnd reduction in loss recovery. 0 = stock behaviour. */
++int sysctl_tcp_lossy_link __read_mostly = 0;
++EXPORT_SYMBOL(sysctl_tcp_lossy_link);
+ int sysctl_tcp_invalid_ratelimit __read_mostly = HZ/2;
+ 
+ #define FLAG_DATA		0x01 /* Incoming frame contained data.		*/
+@@ -1916,7 +1921,10 @@
+ 		tcp_ca_event(sk, CA_EVENT_LOSS);
+ 		tcp_init_undo(tp);
+ 	}
+-	tp->snd_cwnd	   = 1;
++	/* EE542: a timeout on a lossy link says nothing about capacity;
++	 * keep the window and just retransmit. */
++	if (!(sysctl_tcp_lossy_link & 2))
++		tp->snd_cwnd	   = 1;
+ 	tp->snd_cwnd_cnt   = 0;
+ 	tp->snd_cwnd_stamp = tcp_time_stamp;
+ 
+@@ -2509,6 +2517,10 @@
+ 
+ 	if (newly_acked_sacked <= 0 || WARN_ON_ONCE(!tp->prior_cwnd))
+ 		return;
++	/* EE542: proportional rate reduction exists to drain a congested
++	 * queue; on a lossy link there is none. Leave cwnd alone. */
++	if (sysctl_tcp_lossy_link & 4)
++		return;
+ 
+ 	tp->prr_delivered += newly_acked_sacked;
+ 	if (delta < 0) {
+@@ -3338,6 +3350,10 @@
+ /* Decide wheather to run the increase function of congestion control. */
+ static inline bool tcp_may_raise_cwnd(const struct sock *sk, const int flag)
+ {
++	/* EE542: loss recovery is a repair, not a reason to stop growing. */
++	if ((sysctl_tcp_lossy_link & 4) &&
++	    inet_csk(sk)->icsk_ca_state == TCP_CA_Recovery)
++		return flag & FLAG_FORWARD_PROGRESS;
+ 	if (tcp_in_cwnd_reduction(sk))
+ 		return false;
+ 
+--- ../linux-aws-4.4.0-orig/net/ipv4/tcp_timer.c	2026-09-19 06:33:31.562011139 +0000
++++ net/ipv4/tcp_timer.c	2026-09-19 06:37:48.653425382 +0000
+@@ -505,6 +505,11 @@
+ 	    icsk->icsk_retransmits <= TCP_THIN_LINEAR_RETRIES) {
+ 		icsk->icsk_backoff = 0;
+ 		icsk->icsk_rto = min(__tcp_set_rto(tp), TCP_RTO_MAX);
++	} else if (sysctl_tcp_lossy_link & 1) {
++		/* EE542: on a lossy link a timeout is a lost packet, not a
++		 * congested path. Keep the measured RTO instead of doubling it;
++		 * the retry limits still apply through icsk_retransmits. */
++		icsk->icsk_rto = min(icsk->icsk_rto, TCP_RTO_MAX);
+ 	} else {
+ 		/* Use normal (exponential) backoff */
+ 		icsk->icsk_rto = min(icsk->icsk_rto << 1, TCP_RTO_MAX);
+--- ../linux-aws-4.4.0-orig/net/ipv4/sysctl_net_ipv4.c	2026-09-19 06:33:31.554011159 +0000
++++ net/ipv4/sysctl_net_ipv4.c	2026-09-19 06:37:48.653425382 +0000
+@@ -723,6 +723,13 @@
+ 		.proc_handler   = proc_dointvec
+ 	},
+ 	{
++		.procname	= "tcp_lossy_link",
++		.data		= &sysctl_tcp_lossy_link,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec,
++	},
++	{
+ 		.procname	= "tcp_early_retrans",
+ 		.data		= &sysctl_tcp_early_retrans,
+ 		.maxlen		= sizeof(int),
